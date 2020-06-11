@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -28,6 +29,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/astaxie/beego"
 	"github.com/axgle/mahonia"
+	"github.com/vckai/novel/app/utils/log"
 
 	xhttp "github.com/vckai/novel/app/librarys/net/http"
 	"github.com/vckai/novel/app/models"
@@ -46,12 +48,13 @@ var (
 	ErrNotResp      = errors.New("没有返回")
 	ErrNotRule      = errors.New("没有采集规则")
 	ErrNotNov       = errors.New("获取小说失败")
-	ErrNotUrl       = errors.New("没有传入URL地址")
+	ErrNotURL       = errors.New("没有传入URL地址")
 	ErrNotNovName   = errors.New("获取小说书名失败")
-	ErrNotNovLink   = errors.New("获取小说链接失败")
+	ErrNotNovURL    = errors.New("获取小说URL失败")
 	ErrNotNovAuthor = errors.New("获取小说作者失败")
 	ErrNotChapTitle = errors.New("获取小说章节标题失败")
-	ErrNotFindUrl   = errors.New("没有搜索页URL地址")
+	ErrNotFindURL   = errors.New("没有配置搜索页URL地址")
+	ErrInvalidURL   = errors.New("无效的URL地址")
 )
 
 // 采集内容信息
@@ -134,6 +137,8 @@ func (this *Snatch) FindNovel(provider *models.SnatchRule, kw string) (*SnatchIn
 		return nil, ErrNotProvider
 	}
 
+	t1 := time.Now()
+
 	rule := provider.Rules
 
 	if rule == nil {
@@ -152,7 +157,7 @@ func (this *Snatch) FindNovel(provider *models.SnatchRule, kw string) (*SnatchIn
 	}
 
 	if len(rule.FindURL) == 0 {
-		return nil, ErrNotFindUrl
+		return nil, ErrNotFindURL
 	}
 
 	kw = strings.TrimSpace(kw)
@@ -165,7 +170,7 @@ func (this *Snatch) FindNovel(provider *models.SnatchRule, kw string) (*SnatchIn
 	}
 
 	// 请求搜索页面
-	doc, resp, err := this.newHtml(u.String(), charset)
+	doc, resp, err := this.newHtml(u.String(), charset, false)
 	if err != nil {
 		return nil, err
 	}
@@ -181,11 +186,30 @@ func (this *Snatch) FindNovel(provider *models.SnatchRule, kw string) (*SnatchIn
 		novURL, _ = doc.Find(rule.FindBookURLSelector).Attr("href")
 	}
 
-	if len(novURL) == 0 || !this.IsBookURL(provider, novURL) {
-		return nil, ErrNotNovLink
+	if len(novURL) == 0 {
+		return nil, ErrNotNovURL
 	}
 
-	return this.GetNovel(provider, novURL)
+	novURL, err = this.genrateURL(u, novURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if !this.IsBookURL(provider, novURL) {
+		return nil, ErrInvalidURL
+	}
+
+	// 获取小说简介
+	info, err := this.GetNovel(provider, novURL)
+	if err != nil {
+		return nil, err
+	}
+
+	info.UseTime = time.Since(t1)
+
+	log.Debug(fmt.Sprintf("[%s]查找小说[%s]，使用时间：%v", provider.Name, info.Nov.Name, info.UseTime))
+
+	return info, nil
 }
 
 // 获取一本小说
@@ -210,7 +234,7 @@ func (this *Snatch) GetNovel(provider *models.SnatchRule, rawurl string) (*Snatc
 	}
 
 	// 请求采集
-	doc, _, err := this.newHtml(rawurl, provider.Charset)
+	doc, _, err := this.newHtml(rawurl, provider.Charset, true)
 	if err != nil {
 		return nil, err
 	}
@@ -218,21 +242,20 @@ func (this *Snatch) GetNovel(provider *models.SnatchRule, rawurl string) (*Snatc
 	nov := models.NewNovel()
 
 	// 获取封面图片
-	imgAttr := "src"
-	if len(rule.BookCoverAttr) > 0 {
-		imgAttr = rule.BookCoverAttr
+	if len(rule.BookCoverAttr) == 0 {
+		rule.BookCoverAttr = "src"
 	}
 
-	if img, ok := doc.Find(rule.BookCoverSelector).Attr(imgAttr); ok {
+	if img, ok := doc.Find(rule.BookCoverSelector).Attr(rule.BookCoverAttr); ok {
 		nov.Cover = img
 
-		if !strings.Contains(nov.Cover, "http://") && len(nov.Cover) > 0 {
+		if !strings.Contains(nov.Cover, "https://") && !strings.Contains(nov.Cover, "http://") && len(nov.Cover) > 0 {
 			nov.Cover, _ = this.genrateURL(u, nov.Cover)
 		}
 	}
 
 	// 默认封面图片直接重置空
-	if strings.Contains(nov.Cover, rule.BookNoCover) {
+	if len(rule.BookNoCover) > 0 && strings.Contains(nov.Cover, rule.BookNoCover) {
 		nov.Cover = ""
 	}
 
@@ -268,7 +291,11 @@ func (this *Snatch) GetNovel(provider *models.SnatchRule, rawurl string) (*Snatc
 
 	// 获取小说最新章节
 	if len(rule.BookLastChapterTitleSelector) > 0 {
-		nov.ChapterTitle = doc.Find(rule.BookLastChapterTitleSelector).Text()
+		if len(rule.BookLastChapterTitleAttr) > 0 {
+			nov.ChapterTitle = doc.Find(rule.BookLastChapterTitleSelector).AttrOr(rule.BookLastChapterTitleAttr, "")
+		} else {
+			nov.ChapterTitle = doc.Find(rule.BookLastChapterTitleSelector).Text()
+		}
 		nov.ChapterTitle = strings.TrimSpace(nov.ChapterTitle)
 	}
 
@@ -285,26 +312,37 @@ func (this *Snatch) GetNovel(provider *models.SnatchRule, rawurl string) (*Snatc
 	}
 
 	// 获取小说简介
-	nov.Desc, _ = doc.Find(rule.BookDescSelector).Html()
+	if len(rule.BookDescAttr) > 0 {
+		nov.Desc = doc.Find(rule.BookDescSelector).AttrOr(rule.BookDescAttr, "")
+	} else {
+		nov.Desc, _ = doc.Find(rule.BookDescSelector).Html()
+	}
 	nov.Desc = this.filter(rule.BookDescFilter, nov.Desc)
 
 	// 获取章节链接地址
 	chapterLink := rawurl
 	if len(rule.BookChapterURLSelector) > 0 {
-		chapterLink, _ = doc.Find(rule.BookChapterURLSelector).Attr("href")
+		if len(rule.BookChapterURLAttr) == 0 {
+			rule.BookChapterURLAttr = "href"
+		}
+
+		chapterLink = doc.Find(rule.BookChapterURLSelector).AttrOr(rule.BookChapterURLAttr, "")
 		if len(chapterLink) == 0 {
-			return nil, ErrNotNovLink
+			return nil, ErrNotNovURL
 		}
 		// 生成完整链接地址
 		chapterLink, _ = this.genrateURL(u, chapterLink)
 	}
+
+	useTime := time.Since(t1)
+	log.Debug(fmt.Sprintf("[%s]获取小说[%s]，使用时间：%v", provider.Name, nov.Name, useTime))
 
 	return &SnatchInfo{
 		ChapterUrl: chapterLink,
 		Title:      provider.Name,
 		Source:     provider.Code,
 		Url:        rawurl,
-		UseTime:    time.Since(t1),
+		UseTime:    useTime,
 		Nov:        nov,
 	}, nil
 }
@@ -331,7 +369,7 @@ func (this *Snatch) GetChapter(provider *models.SnatchRule, rawurl string) (*Sna
 	}
 
 	// 请求小说详情页面
-	doc, _, err := this.newHtml(rawurl, provider.Charset)
+	doc, _, err := this.newHtml(rawurl, provider.Charset, true)
 	if err != nil {
 		return nil, err
 	}
@@ -354,21 +392,23 @@ func (this *Snatch) GetChapter(provider *models.SnatchRule, rawurl string) (*Sna
 
 	// 获取上一页
 	preURL := ""
-	if rawurl := doc.Find(rule.InfoPrePageSelector).AttrOr("href", ""); len(rawurl) > 0 {
-		rawurl, _ = this.genrateURL(u, rawurl)
-		if !this.IsBookURL(provider, rawurl) {
-			preURL = rawurl
+	if purl := doc.Find(rule.InfoPrePageSelector).AttrOr("href", ""); len(purl) > 0 {
+		purl, _ = this.genrateURL(u, purl)
+		if !this.IsBookURL(provider, purl) && rawurl != purl {
+			preURL = purl
 		}
 	}
 
 	// 获取下一页
 	nextURL := ""
-	if rawurl := doc.Find(rule.InfoNextPageSelector).AttrOr("href", ""); len(rawurl) > 0 {
-		rawurl, _ = this.genrateURL(u, rawurl)
-		if !this.IsBookURL(provider, rawurl) {
-			nextURL = rawurl
+	if nurl := doc.Find(rule.InfoNextPageSelector).AttrOr("href", ""); len(nurl) > 0 {
+		nurl, _ = this.genrateURL(u, nurl)
+		if !this.IsBookURL(provider, nurl) && rawurl != nurl {
+			nextURL = nurl
 		}
 	}
+
+	log.Debug(fmt.Sprintf("[%s]获取小说章节内容[%s][%s]，使用时间：%v", provider.Name, chap.Title, rawurl, time.Since(t1)))
 
 	return &SnatchInfo{
 		Source:  provider.Code,
@@ -384,6 +424,7 @@ func (this *Snatch) GetChapters(provider *models.SnatchRule, rawurl string) ([]*
 	if provider == nil {
 		return nil, ErrNotProvider
 	}
+	t1 := time.Now()
 
 	rule := provider.Rules
 
@@ -401,7 +442,7 @@ func (this *Snatch) GetChapters(provider *models.SnatchRule, rawurl string) ([]*
 	links := make([]*SnatchInfo, 0)
 
 	// 请求章节页面
-	doc, _, err := this.newHtml(rawurl, provider.Charset)
+	doc, _, err := this.newHtml(rawurl, provider.Charset, true)
 	if err != nil {
 		return links, err
 	}
@@ -409,9 +450,20 @@ func (this *Snatch) GetChapters(provider *models.SnatchRule, rawurl string) ([]*
 	lastChap := ""
 	chapNo := uint32(1)
 
-	// 获取小说URL地址
+	catalogSelector := doc.Find(rule.ChapterCatalogSelector)
+
+	// 章节数量
+	catalogSize := catalogSelector.Size()
+
+	// 新书章节小于丢弃数量情况，防止丢失章节
+	// 丢弃章节 = 章节数量 / 2
+	if rule.ChapterAbandonNum > 0 && catalogSize < rule.ChapterAbandonNum*2 {
+		rule.ChapterAbandonNum = catalogSize / 2
+	}
+
 	abandonNum := 1
-	doc.Find(rule.ChapterCatalogSelector).Each(func(i int, s *goquery.Selection) {
+	// 获取小说URL地址
+	catalogSelector.Each(func(i int, s *goquery.Selection) {
 		// 过滤掉最新章节
 		if rule.ChapterAbandonNum >= abandonNum {
 			abandonNum++
@@ -440,10 +492,33 @@ func (this *Snatch) GetChapters(provider *models.SnatchRule, rawurl string) ([]*
 		}
 
 		links = append(links, &SnatchInfo{
-			Chap: chap,
+			Chap:    chap,
+			UseTime: time.Since(t1),
 		})
 		chapNo++
 	})
+
+	log.Debug(fmt.Sprintf("[%s]获取小说章节列表[%s]，使用时间：%v", provider.Name, rawurl, time.Since(t1)))
+
+	if len(rule.ChapterNextPageSelector) == 0 {
+		return links, nil
+	}
+
+	// @TODO
+	// 存在下一页章节目录
+	// 通过递归的方式采集分页章节列表
+	// 不推荐采集章节列表分页的站点，因为请求的次数太多了，导致采集速度过慢。
+	if nextURL := doc.Find(rule.ChapterNextPageSelector).AttrOr("href", ""); len(nextURL) > 0 {
+		nextURL, _ = this.genrateURL(u, nextURL)
+		if !this.IsBookURL(provider, nextURL) && rawurl != nextURL {
+			// 重置第二页的丢弃章节为0
+			provider.Rules.ChapterAbandonNum = 0
+			ls, err := this.GetChapters(provider, nextURL)
+			if err == nil {
+				links = append(links, ls...)
+			}
+		}
+	}
 
 	return links, nil
 }
@@ -455,7 +530,7 @@ func (this *Snatch) Proxy(proxyFunc func() string) {
 
 // 网页请求，失败重试
 // 返回goquery
-func (this *Snatch) newHtml(rawurl, charset string) (*goquery.Document, *http.Response, error) {
+func (this *Snatch) newHtml(rawurl, charset string, isRedirect bool) (*goquery.Document, *http.Response, error) {
 	var res []byte
 	var resp *http.Response
 	var body io.Reader
@@ -466,6 +541,10 @@ func (this *Snatch) newHtml(rawurl, charset string) (*goquery.Document, *http.Re
 		Dial:      10 * time.Second,
 		KeepAlive: 60 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// 存在重定向是否直接跳转
+			if isRedirect {
+				return nil
+			}
 			return http.ErrUseLastResponse
 		},
 	}
@@ -483,8 +562,10 @@ func (this *Snatch) newHtml(rawurl, charset string) (*goquery.Document, *http.Re
 			break
 		}
 
+		log.Debug("请求失败：", rawurl, err)
+
 		// 休眠10ms，防止采集速度过快被屏蔽
-		time.Sleep(time.Duration(50) * time.Millisecond)
+		time.Sleep(time.Duration(10) * time.Millisecond)
 	}
 
 	if err != nil {
@@ -507,6 +588,7 @@ func (this *Snatch) newHtml(rawurl, charset string) (*goquery.Document, *http.Re
 	return doc, resp, nil
 }
 
+// 采集内容过滤
 func (this *Snatch) filter(filter, kw string) string {
 	if len(kw) == 0 {
 		return kw
